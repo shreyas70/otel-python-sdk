@@ -217,6 +217,76 @@ async def test_litellm_async_streaming_span_defers_until_consumed(agent, exporte
     assert attrs.get("gen_ai.response.finish_reasons") == "['stop']"
 
 
+def _streaming_chunks_with_cached_tokens():
+    from litellm.types.utils import (
+        CompletionTokensDetailsWrapper,
+        Delta,
+        ModelResponseStream,
+        PromptTokensDetailsWrapper,
+        StreamingChoices,
+        Usage,
+    )
+
+    return [
+        ModelResponseStream(
+            id="chatcmpl-cache",
+            model="gpt-4o-mini",
+            choices=[StreamingChoices(index=0, delta=Delta(role="assistant", content="hello "))],
+        ),
+        ModelResponseStream(
+            id="chatcmpl-cache",
+            model="gpt-4o-mini",
+            choices=[StreamingChoices(index=0, delta=Delta(content="world"))],
+        ),
+        ModelResponseStream(
+            id="chatcmpl-cache",
+            model="gpt-4o-mini",
+            choices=[StreamingChoices(index=0, delta=Delta(), finish_reason="stop")],
+        ),
+        # Final usage-only chunk, as emitted with stream_options.include_usage=True.
+        ModelResponseStream(
+            id="chatcmpl-cache",
+            model="gpt-4o-mini",
+            choices=[],
+            usage=Usage(
+                prompt_tokens=100,
+                completion_tokens=20,
+                total_tokens=120,
+                prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=80),
+                completion_tokens_details=CompletionTokensDetailsWrapper(reasoning_tokens=7),
+            ),
+        ),
+    ]
+
+
+def test_litellm_streaming_captures_cached_and_reasoning_tokens(agent, exporter, litellm_instrumentor):  # pylint: disable=unused-argument
+    def _fake_stream(*_args, **_kwargs):
+        return iter(_streaming_chunks_with_cached_tokens())
+
+    with patch("litellm.main.completion", new=_fake_stream):
+        litellm_instrumentor.instrument()
+        stream = litellm.completion(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        # Not finished until fully consumed.
+        assert len(_litellm_spans(exporter.get_finished_spans())) == 0
+        list(stream)
+
+    spans = _litellm_spans(exporter.get_finished_spans())
+    exporter.clear()
+    assert len(spans) == 1
+    attrs = spans[0].attributes
+    assert attrs.get("gen_ai.usage.input_tokens") == 100
+    assert attrs.get("gen_ai.usage.output_tokens") == 20
+    assert attrs.get("gen_ai.usage.total_tokens") == 120
+    assert attrs.get("gen_ai.usage.cache_read.input_tokens") == 80
+    assert attrs.get("gen_ai.usage.reasoning.output_tokens") == 7
+    assert attrs.get("gen_ai.response.finish_reasons") == "['stop']"
+
+
 def test_litellm_double_instrument_is_noop(agent, exporter, litellm_instrumentor):  # pylint: disable=unused-argument
     with patch("litellm.main.completion", new=_fake_model_response):
         litellm_instrumentor.instrument()
